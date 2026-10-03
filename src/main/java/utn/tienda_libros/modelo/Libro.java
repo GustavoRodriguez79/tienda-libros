@@ -1,13 +1,11 @@
 package utn.tienda_libros.modelo;
 
-import jakarta.persistence.Entity;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
-import jakarta.persistence.Id;
+import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import lombok.ToString;
+import java.math.BigDecimal;
 
 @Entity
 @Data
@@ -18,9 +16,12 @@ public class Libro {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     Integer idLibro;
+
     String nombreLibro;
     String autor;
-    Double precio;
-    Integer existencias;
 
+    @Column(precision = 10, scale = 2)
+    BigDecimal precio;
+
+    Integer existencias;
 }
