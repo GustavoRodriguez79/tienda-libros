@@ -1,0 +1,29 @@
+# Integracion continua: en cada push o pull request a main compila el proyecto
+# y corre las pruebas unitarias del servicio (no necesitan base de datos).
+name: Java CI with Maven
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar el codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      # Se corre solo LibroServicioTest: TiendaLibrosApplicationTests levanta Spring
+      # completo y necesita MySQL, que no existe en el servidor de GitHub.
+      - name: Compilar y correr las pruebas del servicio
+        run: mvn -B -Dtest=LibroServicioTest test

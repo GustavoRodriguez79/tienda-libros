@@ -1,5 +1,7 @@
 # Tienda de Libros
 
+[![Java CI with Maven](https://github.com/GustavoRodriguez79/tienda-libros/actions/workflows/maven.yml/badge.svg)](https://github.com/GustavoRodriguez79/tienda-libros/actions/workflows/maven.yml)
+
 Aplicación de escritorio para la gestión de un catálogo de libros, desarrollada con **Java**, **Spring Boot** y **Swing**, persistiendo los datos en **MySQL** mediante **Spring Data JPA / Hibernate**.
 
 Proyecto de práctica personal — Tecnicatura Universitaria en Programación (TUP), UTN San Rafael.
