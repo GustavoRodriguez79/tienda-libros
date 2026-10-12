@@ -1,9 +1,16 @@
 package utn.tienda_libros.vista;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.SpringApplication;
+import org.springframework.context.ApplicationContext;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
+import utn.tienda_libros.excepcion.LibroDuplicadoException;
+import utn.tienda_libros.excepcion.LibroInvalidoException;
 import utn.tienda_libros.modelo.Libro;
-import utn.tienda_libros.servicio.LibroServicio;
+import utn.tienda_libros.servicio.ILibroServicio;
 
 import javax.swing.*;
 import javax.swing.table.DefaultTableCellRenderer;
@@ -11,35 +18,36 @@ import javax.swing.table.DefaultTableModel;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.math.BigDecimal;
-import java.math.RoundingMode;
 
 /**
  * Formulario principal de la aplicación "Tienda de Libros".
  * <p>
- * Permite listar, agregar, modificar y eliminar libros, usando {@link LibroServicio}
+ * Permite listar, agregar, modificar y eliminar libros, usando {@link ILibroServicio}
  * como intermediario con la base de datos. La tabla ({@link #tablaLibros}) funciona
  * tanto para mostrar los registros como para seleccionar cuál se va a modificar
  * o eliminar: al hacer clic en una fila, sus datos se cargan automáticamente en
  * los campos de texto del formulario.
  * </p>
  * <p>
- * Características de robustez y usabilidad:
+ * Esta clase solo se ocupa de la pantalla: lee lo que escribe el usuario, llama al
+ * servicio y muestra el resultado. Las reglas de negocio (validaciones, duplicados,
+ * cálculos) están en {@code LibroServicio}.
  * </p>
  * <ul>
- *     <li>Solo se puede seleccionar <b>una</b> fila a la vez ({@link ListSelectionModel#SINGLE_SELECTION}).</li>
- *     <li>Las celdas de la tabla no son editables: los cambios se hacen desde los campos de texto.</li>
- *     <li>Validación de los datos ingresados (campos vacíos, números inválidos, valores negativos).</li>
- *     <li>Confirmación antes de eliminar un libro y antes de salir de la aplicación.</li>
- *     <li>Los botones Modificar y Eliminar solo se habilitan cuando hay un libro seleccionado.</li>
+ *     <li>Solo se puede seleccionar <b>una</b> fila a la vez y las celdas no son editables.</li>
+ *     <li>Si se intenta agregar un libro que ya existe, se ofrece sumar existencias o cambiar el precio.</li>
+ *     <li>Confirmación antes de eliminar y antes de salir.</li>
+ *     <li>Los errores inesperados se registran en el log y se muestran con un mensaje claro.</li>
  * </ul>
  */
 @Component
+@Lazy // se crea recién cuando main() la pide, ya dentro del hilo de Swing (EDT)
 public class LibroFrom extends JFrame {
 
-    /** Precio máximo permitido: la columna en MySQL es DECIMAL(10,2). */
-    private static final BigDecimal PRECIO_MAXIMO = new BigDecimal("99999999.99");
+    private static final Logger log = LoggerFactory.getLogger(LibroFrom.class);
 
-    LibroServicio libroServicio;
+    private final ILibroServicio libroServicio;
+    private final ApplicationContext contexto;
     private JPanel panel;
     private JTable tablaLibros;
     private JTextField libroTexto;
@@ -70,10 +78,12 @@ public class LibroFrom extends JFrame {
      * Acá también se conectan los botones con su lógica correspondiente.
      *
      * @param libroServicio servicio inyectado por Spring, con la lógica de negocio sobre Libro
+     * @param contexto      contexto de Spring, necesario para cerrar la aplicación de forma ordenada
      */
     @Autowired
-    public LibroFrom(LibroServicio libroServicio){
+    public LibroFrom(ILibroServicio libroServicio, ApplicationContext contexto){
         this.libroServicio = libroServicio;
+        this.contexto = contexto;
         iniciarForma();
         agregarButton.addActionListener(e -> agregarLibro());
         modificarButton.addActionListener(e -> modificarLibro());
@@ -88,12 +98,17 @@ public class LibroFrom extends JFrame {
                 salir();
             }
         });
+
+        // La tabla se carga acá (y no en createUIComponents) para que el formulario
+        // ya esté completamente armado cuando se consulta la base de datos.
+        listarLibros();
         actualizarEstadoBotones();
     }
 
     /**
      * Configura la ventana: título, tamaño, comportamiento al cerrar, y la centra
-     * en la pantalla del usuario.
+     * en la pantalla del usuario. No la muestra: de eso se encarga
+     * {@code TiendaLibrosApplication} cuando la tabla ya está cargada.
      */
     private void iniciarForma(){
         setContentPane(panel);
@@ -102,7 +117,6 @@ public class LibroFrom extends JFrame {
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         setSize(900, 700);
         setLocationRelativeTo(null); // centrada en la pantalla
-        setVisible(true);
     }
 
     /**
@@ -110,18 +124,23 @@ public class LibroFrom extends JFrame {
      * <p>
      * Como el libro es nuevo, se pasa {@code null} como id al construirlo — JPA
      * interpreta eso como "insertar un registro nuevo" y genera el id automáticamente.
+     * Si el servicio avisa que ese libro ya existe, se llama a {@link #resolverDuplicado(Libro)}.
      * </p>
      */
     private void agregarLibro(){
-        var libro = leerLibroDelFormulario(null);
+        Libro libro = leerLibroDelFormulario(null);
         if(libro == null){
-            return; // los datos no eran válidos; el mensaje ya se mostró
+            return; // el dato no era un número válido; el aviso ya se mostró
         }
         try {
             this.libroServicio.guardarLibro(libro);
             listarLibros();
             nuevoRegistro();
             mostrarMensaje("Se agregó el libro correctamente");
+        } catch (LibroDuplicadoException ex) {
+            resolverDuplicado(ex.getLibroExistente());
+        } catch (LibroInvalidoException ex) {
+            advertir(ex.getMessage(), campoPara(ex.getCampo()));
         } catch (Exception ex) {
             mostrarError("No se pudo agregar el libro.", ex);
         }
@@ -132,9 +151,9 @@ public class LibroFrom extends JFrame {
      * <p>
      * A diferencia de {@link #agregarLibro()}, acá se reutiliza {@link #idSeleccionado}
      * (el id real que ya existe en la base) al construir el objeto {@link Libro}.
-     * Como ese id ya existe, {@code libroServicio.guardarLibro(libro)} hace un
-     * UPDATE en vez de un INSERT — es el mismo método de servicio para ambos casos,
-     * la diferencia está únicamente en si el id es nulo o no.
+     * Como ese id ya existe, {@code guardarLibro(libro)} hace un UPDATE en vez de un
+     * INSERT — es el mismo método de servicio para ambos casos, la diferencia está
+     * únicamente en si el id es nulo o no.
      * </p>
      */
     private void modificarLibro(){
@@ -142,8 +161,7 @@ public class LibroFrom extends JFrame {
             mostrarMensaje("Seleccione un libro de la tabla para modificar");
             return;
         }
-        // Reutilizamos el id ya existente para que JPA haga UPDATE en vez de INSERT
-        var libro = leerLibroDelFormulario(idSeleccionado);
+        Libro libro = leerLibroDelFormulario(idSeleccionado);
         if(libro == null){
             return;
         }
@@ -152,6 +170,10 @@ public class LibroFrom extends JFrame {
             listarLibros();
             nuevoRegistro();
             mostrarMensaje("Libro modificado correctamente");
+        } catch (LibroDuplicadoException ex) {
+            advertir(ex.getMessage() + ". Cambie el nombre o el autor.", libroTexto);
+        } catch (LibroInvalidoException ex) {
+            advertir(ex.getMessage(), campoPara(ex.getCampo()));
         } catch (Exception ex) {
             mostrarError("No se pudo modificar el libro.", ex);
         }
@@ -161,8 +183,8 @@ public class LibroFrom extends JFrame {
      * Elimina de la base de datos el libro actualmente seleccionado en la tabla,
      * previa confirmación del usuario.
      * <p>
-     * Como {@code libroServicio.eliminarLibro()} necesita el objeto {@link Libro}
-     * completo (no solo el id), primero se busca el libro con
+     * Como {@code eliminarLibro()} necesita el objeto {@link Libro} completo
+     * (no solo el id), primero se busca el libro con
      * {@code buscarLibrosPorId(idSeleccionado)} antes de borrarlo.
      * </p>
      */
@@ -172,9 +194,9 @@ public class LibroFrom extends JFrame {
             return;
         }
         try {
-            var libro = libroServicio.buscarLibrosPorId(idSeleccionado);
+            Libro libro = libroServicio.buscarLibrosPorId(idSeleccionado);
             if(libro == null){
-                mostrarMensaje("No se encontró el libro a eliminar");
+                mostrarMensaje("No se encontró el libro a eliminar. Quizás ya lo borró otra persona.");
                 listarLibros();
                 nuevoRegistro();
                 return;
@@ -198,8 +220,92 @@ public class LibroFrom extends JFrame {
     }
 
     /**
+     * Se usa cuando el usuario intenta agregar un libro que ya existe.
+     * Muestra los datos actuales y ofrece sumar existencias, cambiar el precio o cancelar.
+     *
+     * @param existente el libro que ya estaba cargado en la base
+     */
+    private void resolverDuplicado(Libro existente){
+        String[] opciones = {"Sumar existencias", "Cambiar precio", "Cancelar"};
+        int opcion = JOptionPane.showOptionDialog(this,
+                "El libro \"" + existente.getNombreLibro() + "\" de " + existente.getAutor() + " ya existe.\n\n"
+                        + "Existencias actuales: " + existente.getExistencias() + "\n"
+                        + "Precio actual: " + existente.getPrecio() + "\n\n"
+                        + "¿Qué desea hacer?",
+                "Libro existente",
+                JOptionPane.DEFAULT_OPTION,
+                JOptionPane.QUESTION_MESSAGE,
+                null, opciones, opciones[2]);
+        if(opcion == 0){
+            sumarExistenciasAlExistente(existente);
+        } else if(opcion == 1){
+            cambiarPrecioDelExistente(existente);
+        }
+        // Cancelar, o cerrar el diálogo con la X: no se hace nada
+    }
+
+    /**
+     * Pide cuántas unidades sumar (propone las que se escribieron en el campo
+     * Existencia) y las suma al libro que ya existía.
+     */
+    private void sumarExistenciasAlExistente(Libro existente){
+        Object entrada = JOptionPane.showInputDialog(this,
+                "¿Cuántas unidades desea sumar a \"" + existente.getNombreLibro() + "\"?",
+                "Sumar existencias", JOptionPane.QUESTION_MESSAGE,
+                null, null, existenciasTexto.getText().trim());
+        if(entrada == null){
+            return; // canceló
+        }
+        try {
+            int cantidad = Integer.parseInt(entrada.toString().trim());
+            libroServicio.sumarExistencias(existente.getIdLibro(), cantidad);
+            listarLibros();
+            nuevoRegistro();
+            mostrarMensaje("Se sumaron " + cantidad + " unidades a \"" + existente.getNombreLibro() + "\"");
+        } catch (NumberFormatException ex) {
+            mostrarAdvertencia("La cantidad debe ser un número entero (ejemplo: 10)");
+        } catch (LibroInvalidoException ex) {
+            mostrarAdvertencia(ex.getMessage());
+        } catch (Exception ex) {
+            mostrarError("No se pudieron sumar las existencias.", ex);
+        }
+    }
+
+    /**
+     * Pide el precio nuevo (propone el que se escribió en el campo Precio)
+     * y se lo cambia al libro que ya existía.
+     */
+    private void cambiarPrecioDelExistente(Libro existente){
+        Object entrada = JOptionPane.showInputDialog(this,
+                "Nuevo precio de \"" + existente.getNombreLibro() + "\":",
+                "Cambiar precio", JOptionPane.QUESTION_MESSAGE,
+                null, null, precioTexto.getText().trim());
+        if(entrada == null){
+            return; // canceló
+        }
+        try {
+            BigDecimal precio = new BigDecimal(entrada.toString().trim().replace(',', '.'));
+            libroServicio.actualizarPrecio(existente.getIdLibro(), precio);
+            listarLibros();
+            nuevoRegistro();
+            mostrarMensaje("Se actualizó el precio de \"" + existente.getNombreLibro() + "\"");
+        } catch (NumberFormatException ex) {
+            mostrarAdvertencia("El precio debe ser un número válido (ejemplo: 1500.50)");
+        } catch (LibroInvalidoException ex) {
+            mostrarAdvertencia(ex.getMessage());
+        } catch (Exception ex) {
+            mostrarError("No se pudo cambiar el precio.", ex);
+        }
+    }
+
+    /**
      * Cierra la aplicación, previa confirmación del usuario.
      * Lo usan tanto el botón "Salir" como la "X" de la ventana.
+     * <p>
+     * {@link SpringApplication#exit(ApplicationContext, org.springframework.boot.ExitCodeGenerator...)}
+     * cierra el contexto de Spring (y con él las conexiones a la base de datos)
+     * antes de terminar el programa.
+     * </p>
      */
     private void salir(){
         int respuesta = JOptionPane.showConfirmDialog(this,
@@ -209,91 +315,89 @@ public class LibroFrom extends JFrame {
                 JOptionPane.QUESTION_MESSAGE);
         if(respuesta == JOptionPane.YES_OPTION){
             dispose();
-            System.exit(0);
+            System.exit(SpringApplication.exit(contexto));
         }
     }
 
     /**
-     * Lee y valida los 4 campos del formulario y arma el objeto {@link Libro}.
+     * Lee los 4 campos del formulario y arma el objeto {@link Libro}.
      * <p>
-     * Validaciones: nombre y autor no vacíos; precio numérico, mayor a cero y que
-     * entre en DECIMAL(10,2); existencias entero y no negativo. Acepta coma o punto
-     * como separador decimal. Ante el primer dato inválido muestra un aviso, deja
-     * el cursor en ese campo y devuelve {@code null}.
+     * Acá solo se convierten los textos a números (precio y existencias). Si no se puede
+     * convertir, se avisa y se devuelve {@code null}. Todo lo demás (campos vacíos,
+     * rangos, largos, duplicados) lo valida {@code LibroServicio}. Un campo numérico vacío
+     * se envía como {@code null} y el servicio responde con el aviso correspondiente.
      * </p>
      *
      * @param id id del libro (o {@code null} si es uno nuevo)
-     * @return el libro listo para guardar, o {@code null} si hubo algún dato inválido
+     * @return el libro armado, o {@code null} si el precio o las existencias no eran números
      */
     private Libro leerLibroDelFormulario(Integer id){
-        String nombre = libroTexto.getText().trim();
-        String autor = autorTexto.getText().trim();
-        String precioStr = precioTexto.getText().trim().replace(',', '.');
-        String existenciasStr = existenciasTexto.getText().trim();
-
-        if(nombre.isEmpty()){
-            advertir("Ingrese el nombre del libro", libroTexto);
-            return null;
-        }
-        if(autor.isEmpty()){
-            advertir("Ingrese el autor del libro", autorTexto);
-            return null;
-        }
-        if(precioStr.isEmpty()){
-            advertir("Ingrese el precio del libro", precioTexto);
-            return null;
+        BigDecimal precio = null;
+        String textoPrecio = precioTexto.getText().trim().replace(',', '.');
+        if(!textoPrecio.isEmpty()){
+            try {
+                precio = new BigDecimal(textoPrecio);
+            } catch (NumberFormatException ex) {
+                advertir("El precio debe ser un número válido (ejemplo: 1500.50)", precioTexto);
+                return null;
+            }
         }
 
-        BigDecimal precio;
-        try {
-            precio = new BigDecimal(precioStr).setScale(2, RoundingMode.HALF_UP);
-        } catch (NumberFormatException ex) {
-            advertir("El precio debe ser un número válido (ejemplo: 1500.50)", precioTexto);
-            return null;
-        }
-        if(precio.signum() <= 0){
-            advertir("El precio debe ser mayor a cero", precioTexto);
-            return null;
-        }
-        if(precio.compareTo(PRECIO_MAXIMO) > 0){
-            advertir("El precio es demasiado grande (máximo " + PRECIO_MAXIMO + ")", precioTexto);
-            return null;
+        Integer existencias = null;
+        String textoExistencias = existenciasTexto.getText().trim();
+        if(!textoExistencias.isEmpty()){
+            try {
+                existencias = Integer.valueOf(textoExistencias);
+            } catch (NumberFormatException ex) {
+                advertir("Las existencias deben ser un número entero (ejemplo: 25)", existenciasTexto);
+                return null;
+            }
         }
 
-        if(existenciasStr.isEmpty()){
-            advertir("Ingrese las existencias del libro", existenciasTexto);
-            return null;
-        }
-        int existencias;
-        try {
-            existencias = Integer.parseInt(existenciasStr);
-        } catch (NumberFormatException ex) {
-            advertir("Las existencias deben ser un número entero (ejemplo: 25)", existenciasTexto);
-            return null;
-        }
-        if(existencias < 0){
-            advertir("Las existencias no pueden ser negativas", existenciasTexto);
-            return null;
-        }
+        return new Libro(id, libroTexto.getText(), autorTexto.getText(), precio, existencias);
+    }
 
-        return new Libro(id, nombre, autor, precio, existencias);
+    /**
+     * Traduce el nombre de campo que informa el servicio al componente de la pantalla.
+     *
+     * @return el campo de texto correspondiente, o {@code null} si el error no es de un campo puntual
+     */
+    private JTextField campoPara(String campo){
+        if(campo == null){
+            return null;
+        }
+        return switch (campo) {
+            case LibroInvalidoException.CAMPO_NOMBRE -> libroTexto;
+            case LibroInvalidoException.CAMPO_AUTOR -> autorTexto;
+            case LibroInvalidoException.CAMPO_PRECIO -> precioTexto;
+            case LibroInvalidoException.CAMPO_EXISTENCIAS -> existenciasTexto;
+            default -> null;
+        };
     }
 
     /**
      * Deja el formulario listo para cargar un libro nuevo: vacía los campos,
-     * quita la selección de la tabla y deshabilita Modificar/Eliminar.
+     * quita la selección de la tabla, deshabilita Modificar/Eliminar y
+     * deja el cursor en el campo Libro.
      */
     private void nuevoRegistro(){
-        limpiarFormulario();
-        idSeleccionado = null;
-        tablaLibros.clearSelection();
-        actualizarEstadoBotones();
+        deseleccionar();
         libroTexto.requestFocusInWindow();
     }
 
     /**
+     * Vacía el formulario y quita la selección de la tabla, sin mover el cursor.
+     */
+    private void deseleccionar(){
+        limpiarFormulario();
+        idSeleccionado = null;
+        tablaLibros.clearSelection();
+        actualizarEstadoBotones();
+    }
+
+    /**
      * Vacía los 4 campos de texto del formulario.
-     * No toca {@link #idSeleccionado} a propósito — eso lo maneja {@link #nuevoRegistro()}.
+     * No toca {@link #idSeleccionado} a propósito — eso lo maneja {@link #deseleccionar()}.
      */
     private void limpiarFormulario(){
         libroTexto.setText("");
@@ -328,27 +432,38 @@ public class LibroFrom extends JFrame {
     }
 
     /**
+     * Muestra un aviso de advertencia (sin mover el cursor).
+     */
+    private void mostrarAdvertencia(String mensaje){
+        JOptionPane.showMessageDialog(this, mensaje, "Dato inválido", JOptionPane.WARNING_MESSAGE);
+    }
+
+    /**
      * Muestra un aviso de dato inválido y deja el cursor, con el texto seleccionado,
      * en el campo que hay que corregir.
      *
      * @param mensaje explicación del problema
-     * @param campo   campo de texto a enfocar
+     * @param campo   campo de texto a enfocar (puede ser {@code null})
      */
     private void advertir(String mensaje, JTextField campo){
-        JOptionPane.showMessageDialog(this, mensaje, "Dato inválido", JOptionPane.WARNING_MESSAGE);
-        campo.requestFocusInWindow();
-        campo.selectAll();
+        mostrarAdvertencia(mensaje);
+        if(campo != null){
+            campo.requestFocusInWindow();
+            campo.selectAll();
+        }
     }
 
     /**
      * Muestra un error inesperado (por ejemplo, la base de datos no responde).
+     * El detalle técnico no se le muestra al usuario: se guarda en el log.
      *
      * @param mensaje descripción de lo que se intentaba hacer
-     * @param ex      excepción original, de la que se muestra el detalle
+     * @param ex      excepción original, que se registra en el log
      */
     private void mostrarError(String mensaje, Exception ex){
+        log.error(mensaje, ex);
         JOptionPane.showMessageDialog(this,
-                mensaje + "\nDetalle: " + ex.getMessage(),
+                mensaje + "\nRevise la conexión con la base de datos e intente nuevamente.",
                 "Error", JOptionPane.ERROR_MESSAGE);
     }
 
@@ -407,8 +522,6 @@ public class LibroFrom extends JFrame {
                 actualizarEstadoBotones();
             }
         });
-
-        listarLibros();
     }
 
     /**
@@ -418,22 +531,30 @@ public class LibroFrom extends JFrame {
      * siempre refleje el estado actual de la base.
      */
     private void listarLibros(){
-        //Limpiar la tabla
-        tablaModeloLibros.setRowCount(0);
-        //Obrener los libros de la BD
-        var libros = libroServicio.listarLibros();
-        //Iteramos cada libro
-        libros.forEach((libro) ->{//Función Lambda
-            // Creamos cada registro para agregarlos a la tabla
-            Object [] renglonLibro = {
-                    libro.getIdLibro(),
-                    libro.getNombreLibro(),
-                    libro.getAutor(),
-                    libro.getPrecio(),
-                    libro.getExistencias(),
-            };
-            this.tablaModeloLibros.addRow(renglonLibro);
-        });
+        try {
+            //Limpiar la tabla
+            tablaModeloLibros.setRowCount(0);
+            //Obrener los libros de la BD
+            var libros = libroServicio.listarLibros();
+            //Iteramos cada libro
+            libros.forEach(this::agregarFila);
+        } catch (Exception ex) {
+            mostrarError("No se pudo cargar la lista de libros.", ex);
+        }
+    }
 
+    /**
+     * Agrega un libro como una fila nueva de la tabla.
+     */
+    private void agregarFila(Libro libro){
+        // Creamos cada registro para agregarlos a la tabla
+        Object [] renglonLibro = {
+                libro.getIdLibro(),
+                libro.getNombreLibro(),
+                libro.getAutor(),
+                libro.getPrecio(),
+                libro.getExistencias(),
+        };
+        this.tablaModeloLibros.addRow(renglonLibro);
     }
 }
