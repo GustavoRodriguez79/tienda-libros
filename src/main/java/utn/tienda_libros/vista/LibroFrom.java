@@ -13,11 +13,18 @@ import utn.tienda_libros.modelo.Libro;
 import utn.tienda_libros.servicio.ILibroServicio;
 
 import javax.swing.*;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
+import java.awt.Color;
+import java.awt.Font;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.math.BigDecimal;
+import java.text.NumberFormat;
+import java.util.List;
+import java.util.Locale;
 
 /**
  * Formulario principal de la aplicación "Tienda de Libros".
@@ -38,6 +45,7 @@ import java.math.BigDecimal;
  *     <li>Si se intenta agregar un libro que ya existe, se ofrece sumar existencias o cambiar el precio.</li>
  *     <li>Confirmación antes de eliminar y antes de salir.</li>
  *     <li>Los errores inesperados se registran en el log y se muestran con un mensaje claro.</li>
+ *     <li>Buscador por título o autor, resaltado de stock bajo y resumen del inventario.</li>
  * </ul>
  */
 @Component
@@ -45,6 +53,9 @@ import java.math.BigDecimal;
 public class LibroFrom extends JFrame {
 
     private static final Logger log = LoggerFactory.getLogger(LibroFrom.class);
+
+    /** Los libros con menos existencias que este valor se resaltan en rojo. */
+    private static final int STOCK_BAJO = 5;
 
     private final ILibroServicio libroServicio;
     private final ApplicationContext contexto;
@@ -59,6 +70,8 @@ public class LibroFrom extends JFrame {
     private JButton eliminarButton;
     private JButton limpiarButton;
     private JButton salirButton;
+    private JTextField buscarTexto;
+    private JLabel resumenLabel;
     private DefaultTableModel tablaModeloLibros;
 
     /**
@@ -96,6 +109,24 @@ public class LibroFrom extends JFrame {
             @Override
             public void windowClosing(WindowEvent e) {
                 salir();
+            }
+        });
+
+        // Cada vez que cambia el texto del buscador se vuelve a filtrar la tabla
+        buscarTexto.getDocument().addDocumentListener(new DocumentListener() {
+            @Override
+            public void insertUpdate(DocumentEvent e) {
+                alCambiarBusqueda();
+            }
+
+            @Override
+            public void removeUpdate(DocumentEvent e) {
+                alCambiarBusqueda();
+            }
+
+            @Override
+            public void changedUpdate(DocumentEvent e) {
+                alCambiarBusqueda();
             }
         });
 
@@ -504,7 +535,32 @@ public class LibroFrom extends JFrame {
         centrado.setHorizontalAlignment(SwingConstants.CENTER);
         tablaLibros.getColumnModel().getColumn(0).setCellRenderer(centrado); // Id
         tablaLibros.getColumnModel().getColumn(3).setCellRenderer(centrado); // Precio
-        tablaLibros.getColumnModel().getColumn(4).setCellRenderer(centrado); // Existencias
+
+        // Existencias: centradas, y en rojo y negrita cuando el stock es bajo
+        DefaultTableCellRenderer stock = new DefaultTableCellRenderer() {
+            @Override
+            public java.awt.Component getTableCellRendererComponent(JTable tabla, Object valor,
+                    boolean seleccionada, boolean conFoco, int fila, int columna) {
+                java.awt.Component celda = super.getTableCellRendererComponent(
+                        tabla, valor, seleccionada, conFoco, fila, columna);
+                boolean bajo = valor instanceof Integer cantidad && cantidad < STOCK_BAJO;
+                // Swing reutiliza el mismo renderer para todas las filas: hay que dejar
+                // SIEMPRE el estilo normal y recien despues pintar de rojo.
+                celda.setFont(tabla.getFont());
+                if(!seleccionada){
+                    celda.setForeground(tabla.getForeground());
+                }
+                if(bajo){
+                    celda.setFont(tabla.getFont().deriveFont(Font.BOLD));
+                    if(!seleccionada){
+                        celda.setForeground(Color.RED);
+                    }
+                }
+                return celda;
+            }
+        };
+        stock.setHorizontalAlignment(SwingConstants.CENTER);
+        tablaLibros.getColumnModel().getColumn(4).setCellRenderer(stock); // Existencias
 
         // Al hacer clic en una fila, copiamos sus datos a los campos de texto
         // y guardamos el id en idSeleccionado, para que Modificar/Eliminar sepan
@@ -525,22 +581,57 @@ public class LibroFrom extends JFrame {
     }
 
     /**
-     * Recarga la tabla con el listado completo de libros desde la base de datos.
-     * Se llama al iniciar el formulario y después de cualquier operación que
-     * cambie los datos (agregar, modificar, eliminar), para que la tabla
-     * siempre refleje el estado actual de la base.
+     * Cada vez que cambia el texto del buscador: si había un libro seleccionado se
+     * deselecciona (porque la tabla va a cambiar) y se vuelve a cargar la lista filtrada.
+     */
+    private void alCambiarBusqueda(){
+        if(idSeleccionado != null){
+            deseleccionar();
+        }
+        listarLibros();
+    }
+
+    /**
+     * Recarga la tabla desde la base de datos, aplicando el filtro del buscador
+     * (por título o autor) si hay algún texto escrito. Se llama al iniciar el formulario,
+     * al cambiar el buscador y después de cualquier operación que cambie los datos
+     * (agregar, modificar, eliminar), para que la tabla siempre refleje el estado actual.
      */
     private void listarLibros(){
         try {
             //Limpiar la tabla
             tablaModeloLibros.setRowCount(0);
             //Obrener los libros de la BD
-            var libros = libroServicio.listarLibros();
+            List<Libro> todos = libroServicio.listarLibros();
+            String filtro = buscarTexto == null ? "" : buscarTexto.getText().trim();
+            List<Libro> mostrados = filtro.isEmpty() ? todos : libroServicio.buscarLibros(filtro);
             //Iteramos cada libro
-            libros.forEach(this::agregarFila);
+            mostrados.forEach(this::agregarFila);
+            actualizarResumen(todos, mostrados.size());
         } catch (Exception ex) {
             mostrarError("No se pudo cargar la lista de libros.", ex);
         }
+    }
+
+    /**
+     * Actualiza el texto de abajo con la cantidad de libros, cuántos tienen stock bajo
+     * y el valor total del inventario (precio por existencias de todos los libros).
+     *
+     * @param todos     todos los libros de la base (el valor del inventario no depende del filtro)
+     * @param mostrados cuántos libros se están viendo en la tabla
+     */
+    private void actualizarResumen(List<Libro> todos, int mostrados){
+        if(resumenLabel == null){
+            return; // el formulario todavía se está armando
+        }
+        long stockBajo = todos.stream()
+                .filter(libro -> libro.getExistencias() != null && libro.getExistencias() < STOCK_BAJO)
+                .count();
+        NumberFormat moneda = NumberFormat.getCurrencyInstance(Locale.of("es", "AR"));
+        String valorTotal = moneda.format(libroServicio.calcularValorInventario(todos));
+        resumenLabel.setText("Mostrando " + mostrados + " de " + todos.size() + " libros   |   "
+                + "Stock bajo (menos de " + STOCK_BAJO + "): " + stockBajo + "   |   "
+                + "Valor total del inventario: " + valorTotal);
     }
 
     /**
