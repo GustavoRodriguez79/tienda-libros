@@ -31,3 +31,22 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Secretos y configuración local ###
+.env
+*.env
+application-local.*
+*.pem
+*.key
+*.p12
+*.jks
+
+### Logs y sistema ###
+*.log
+logs/
+.DS_Store
+Thumbs.db
+
+### NetBeans (archivos de proyecto) ###
+nbactions.xml
+nb-configuration.xml
